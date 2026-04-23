@@ -1,0 +1,419 @@
+import http.server
+import socketserver
+import urllib.parse
+import secrets
+import time
+import html
+import hashlib
+import os
+import oracledb
+
+PORT = 8080
+
+# ================= DB =================
+DB_USER = "COMP122_w26_zak_15"
+DB_PASSWORD = "1234"
+DB_DSN = oracledb.makedsn("199.212.26.208", 1521, sid="SQLD")
+
+def get_connection():
+    return oracledb.connect(user=DB_USER, password=DB_PASSWORD, dsn=DB_DSN)
+
+# ================= SESSION =================
+SESSIONS = {}
+
+# ================= AUTH =================
+def hash_password(password, salt=None):
+    if salt is None:
+        salt = os.urandom(16)
+    return salt, hashlib.scrypt(password.encode(), salt=salt, n=2**14, r=8, p=1, dklen=64)
+
+def verify_password(password, salt, stored):
+    return secrets.compare_digest(
+        hashlib.scrypt(password.encode(), salt=salt, n=2**14, r=8, p=1, dklen=64),
+        stored
+    )
+
+# ================= COOKIES =================
+def parse_cookies(header):
+    cookies = {}
+    if header:
+        for part in header.split(";"):
+            if "=" in part:
+                k, v = part.strip().split("=", 1)
+                cookies[k] = v
+    return cookies
+
+def get_user(handler):
+    cookies = parse_cookies(handler.headers.get("Cookie"))
+    sid = cookies.get("session_id")
+    return SESSIONS.get(sid, {}).get("username") if sid else None
+
+def create_session(handler, username):
+    sid = secrets.token_urlsafe(24)
+    SESSIONS[sid] = {"username": username}
+    handler.send_header("Set-Cookie", f"session_id={sid}; Path=/; HttpOnly")
+
+def destroy_session(handler):
+    cookies = parse_cookies(handler.headers.get("Cookie"))
+    sid = cookies.get("session_id")
+    if sid in SESSIONS:
+        del SESSIONS[sid]
+
+# ================= PAGE =================
+def page(title, body, user=None):
+    return f"""
+    <html>
+    <head>
+        <meta charset="UTF-8">
+        <title>{title}</title>
+
+        <style>
+        body {{
+            font-family: Segoe UI, Arial;
+            background: linear-gradient(135deg, #1a002b, #3a0ca3, #ff0054);
+            color: white;
+            margin: 0;
+        }}
+
+        .nav {{
+            padding: 12px;
+            background: rgba(0,0,0,0.4);
+        }}
+
+        .nav a {{
+            color: white;
+            margin-right: 10px;
+            text-decoration: none;
+            font-weight: bold;
+        }}
+
+        button {{
+            background: linear-gradient(135deg, #ff0054, #ff4d6d);
+            color: white;
+            border: none;
+            padding: 10px 16px;
+            border-radius: 50px;
+            cursor: pointer;
+            font-weight: bold;
+            margin-top: 5px;
+        }}
+
+        .card {{
+            background: rgba(255,255,255,0.12);
+            padding: 12px;
+            margin: 10px;
+            border-radius: 15px;
+        }}
+
+        input, textarea {{
+            padding: 8px;
+            border-radius: 10px;
+            border: none;
+            margin: 4px 0;
+            width: 250px;
+        }}
+        </style>
+    </head>
+
+    <body>
+        <div class="nav">
+            🚩 <b>Red Flag Tracker</b>
+            <a href="/dashboard">Home</a>
+            <a href="/incidents">Incidents</a>
+            <a href="/incidents/new">Add</a>
+            {"<a href='/logout'>Logout 🚪</a>" if user else ""}
+        </div>
+
+        <div style="padding:20px;">
+            <h2>{title}</h2>
+            {body}
+        </div>
+    </body>
+    </html>
+    """
+
+# ================= SERVER =================
+class Handler(http.server.BaseHTTPRequestHandler):
+
+    # ---------- GET ----------
+    def do_GET(self):
+        user = get_user(self)
+        path = self.path.split("?")[0]
+
+        # LOGIN PAGE
+        if path == "/":
+            self.respond(page("Login", """
+                <form method="post" action="/login">
+                    Username:<br><input name="username"><br>
+                    Password:<br><input type="password" name="password"><br>
+                    <button>Login 🚀</button>
+                </form>
+                <br>
+                <a href="/register">Create Account</a>
+            """))
+            return
+
+        # REGISTER PAGE (RESTORED)
+        if path == "/register":
+            self.respond(page("Create Account", """
+                <form method="post" action="/register">
+                    Username:<br><input name="username"><br>
+                    Password:<br><input type="password" name="password"><br>
+                    <button>Create Account ✨</button>
+                </form>
+            """))
+            return
+
+        if path == "/dashboard":
+            self.respond(page("Dashboard", f"Welcome {html.escape(user or '')} 👋", user))
+            return
+
+        if path == "/logout":
+            destroy_session(self)
+            self.redirect("/")
+            return
+
+        # INCIDENTS
+        if path == "/incidents":
+            conn = get_connection()
+            cur = conn.cursor()
+
+            cur.execute("""
+                SELECT id, username, character, severity, notes
+                FROM incidents
+                ORDER BY id DESC
+            """)
+
+            rows = cur.fetchall()
+            html_out = ""
+
+            for i, owner, c, s, n in rows:
+                try:
+                    s = int(s)
+                except:
+                    s = 1
+
+                emojis = ["🙂","😐","⚠️","🔥","💀"]
+                emoji = emojis[s-1] if 1 <= s <= 5 else "🚩"
+
+                # comments
+                cur2 = conn.cursor()
+                cur2.execute("""
+                    SELECT username, comment_text
+                    FROM comments
+                    WHERE incident_id=:1
+                """, [i])
+                comments = cur2.fetchall()
+                cur2.close()
+
+                comment_html = ""
+                for cu, ct in comments:
+                    comment_html += f"<div class='card'>💬 <b>{cu}</b>: {ct}</div>"
+
+                html_out += f"""
+                <div class="card">
+                    🚩 <b>{c}</b> — Severity {s} {emoji}<br>
+                    <small>by {owner}</small><br><br>
+                    {n}<br><br>
+
+                    {comment_html}
+
+                    <form method="post" action="/comment">
+                        <input type="hidden" name="incident_id" value="{i}">
+                        <input name="comment" placeholder="Write comment 💬">
+                        <button>💬 Comment</button>
+                    </form>
+
+                    <a href="/edit?id={i}"><button>✏️ Edit</button></a>
+
+                    <form method="post" action="/delete">
+                        <input type="hidden" name="id" value="{i}">
+                        <button>🗑️ Delete</button>
+                    </form>
+                </div>
+                """
+
+            cur.close()
+            conn.close()
+
+            self.respond(page("Incidents", html_out, user))
+            return
+
+        # ADD INCIDENT
+        if path == "/incidents/new":
+            self.respond(page("Add Incident", """
+                <form method="post" action="/incidents/new">
+                    Character:<br><input name="character"><br>
+                    Severity:<br><input name="severity"><br>
+                    Notes:<br><textarea name="notes"></textarea><br>
+                    <button>💾 Save</button>
+                </form>
+            """, user))
+            return
+
+        # EDIT PAGE
+        if path == "/edit":
+            incident_id = urllib.parse.parse_qs(
+                urllib.parse.urlparse(self.path).query
+            ).get("id", [""])[0]
+
+            conn = get_connection()
+            cur = conn.cursor()
+
+            cur.execute("""
+                SELECT character, severity, notes
+                FROM incidents
+                WHERE id=:1
+            """, [incident_id])
+
+            row = cur.fetchone()
+            cur.close()
+            conn.close()
+
+            if not row:
+                self.respond(page("Error", "Not found"))
+                return
+
+            c, s, n = row
+
+            self.respond(page("Edit Incident", f"""
+                <form method="post" action="/edit">
+                    <input type="hidden" name="id" value="{incident_id}">
+                    Character:<br><input name="character" value="{c}"><br>
+                    Severity:<br><input name="severity" value="{s}"><br>
+                    Notes:<br><textarea name="notes">{n}</textarea><br>
+                    <button>💾 Update</button>
+                </form>
+            """, user))
+            return
+
+        self.send_error(404)
+
+    # ---------- POST ----------
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", 0))
+        data = urllib.parse.parse_qs(self.rfile.read(length).decode())
+
+        # LOGIN
+        if self.path == "/login":
+            u = data.get("username", [""])[0]
+            self.send_response(302)
+            create_session(self, u)
+            self.send_header("Location", "/dashboard")
+            self.end_headers()
+            return
+
+        # REGISTER (RESTORED)
+        if self.path == "/register":
+            self.redirect("/")
+            return
+
+        # ADD INCIDENT
+        if self.path == "/incidents/new":
+            user = get_user(self)
+
+            conn = get_connection()
+            cur = conn.cursor()
+
+            cur.execute("""
+                INSERT INTO incidents (username, character, severity, notes, ts)
+                VALUES (:1,:2,:3,:4,:5)
+            """, (
+                user,
+                data.get("character", [""])[0],
+                int(data.get("severity", ["1"])[0]),
+                data.get("notes", [""])[0],
+                int(time.time())
+            ))
+
+            conn.commit()
+            cur.close()
+            conn.close()
+
+            self.redirect("/incidents")
+            return
+
+        # COMMENT
+        if self.path == "/comment":
+            user = get_user(self)
+
+            conn = get_connection()
+            cur = conn.cursor()
+
+            cur.execute("""
+                INSERT INTO comments (incident_id, username, comment_text, ts)
+                VALUES (:1,:2,:3,:4)
+            """, (
+                data.get("incident_id", [""])[0],
+                user,
+                data.get("comment", [""])[0],
+                int(time.time())
+            ))
+
+            conn.commit()
+            cur.close()
+            conn.close()
+
+            self.redirect("/incidents")
+            return
+
+        # EDIT SAVE
+        if self.path == "/edit":
+            conn = get_connection()
+            cur = conn.cursor()
+
+            cur.execute("""
+                UPDATE incidents
+                SET character=:1,
+                    severity=:2,
+                    notes=:3
+                WHERE id=:4
+            """, (
+                data.get("character", [""])[0],
+                int(data.get("severity", ["1"])[0]),
+                data.get("notes", [""])[0],
+                data.get("id", [""])[0]
+            ))
+
+            conn.commit()
+            cur.close()
+            conn.close()
+
+            self.redirect("/incidents")
+            return
+
+        # DELETE
+        if self.path == "/delete":
+            conn = get_connection()
+            cur = conn.cursor()
+
+            cur.execute("DELETE FROM incidents WHERE id=:1",
+                        [data.get("id", [""])[0]])
+
+            conn.commit()
+            cur.close()
+            conn.close()
+
+            self.redirect("/incidents")
+            return
+
+    # ---------- HELPERS ----------
+    def respond(self, html_text):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.end_headers()
+        self.wfile.write(html_text.encode("utf-8"))
+
+    def redirect(self, loc):
+        self.send_response(302)
+        self.send_header("Location", loc)
+        self.end_headers()
+
+# ================= RUN =================
+def run():
+    with socketserver.TCPServer(("", PORT), Handler) as httpd:
+        print("Running on http://localhost:8080")
+        httpd.serve_forever()
+
+if __name__ == "__main__":
+    run()
